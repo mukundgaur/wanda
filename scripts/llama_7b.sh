@@ -15,7 +15,8 @@ run_python_command () {
     --prune_method $1 \
     --sparsity_ratio $sparsity_ratio \
     --sparsity_type $2 \
-    --save $3
+    --save $3 \
+    --save_model $3/pruned_model
 }
 
 # llama-7b with wanda pruning method

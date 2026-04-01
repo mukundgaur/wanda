@@ -123,12 +123,104 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
                 W_mask = (W_metric<=thresh)
 
             W[W_mask] = 0
+    
+def prune_wanda_block(args, model, tokenizer, device=torch.device("cuda:0"), block_size=16):
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    print("loading calibration data")
+    dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
+    print("dataset loading complete")
+
+    with torch.no_grad():
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+
+    layers = model.model.layers
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        if f"model.layers.{i}" in model.hf_device_map:
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+
+        wrapped_layers = {}
+        for name in subset:
+            wrapped_layers[name] = WrappedGPT(subset[name])
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in wrapped_layers:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+
+        for h in handles:
+            h.remove()
+
+        for name in subset:
+            print(f"pruning layer {i} name {name}")
+            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
+
+            rows, cols = W_metric.shape
+            pad_rows = (block_size - rows % block_size) % block_size
+            pad_cols = (block_size - cols % block_size) % block_size
+            W_metric_padded = torch.nn.functional.pad(W_metric, (0, pad_cols, 0, pad_rows), value=0)
+
+            br = W_metric_padded.shape[0] // block_size
+            bc = W_metric_padded.shape[1] // block_size
+
+            # Compute mean Wanda score per block
+            block_scores = (
+                W_metric_padded
+                .reshape(br, block_size, bc, block_size)
+                .permute(0, 2, 1, 3)
+                .reshape(br * bc, -1)
+                .mean(dim=1)
+                .reshape(br, bc)
+            )
+
+            # Prune lowest-scoring blocks globally
+            num_blocks = br * bc
+            num_prune = int(num_blocks * args.sparsity_ratio)
+            if num_prune > 0:
+                threshold = torch.topk(block_scores.flatten(), num_prune, largest=False)[0][-1]
+                block_mask = block_scores <= threshold
+            else:
+                block_mask = torch.zeros(br, bc, dtype=torch.bool, device=W_metric.device)
+
+            # Expand block mask to full weight dimensions
+            W_mask_padded = (
+                block_mask
+                .unsqueeze(2).unsqueeze(3)
+                .expand(br, bc, block_size, block_size)
+                .permute(0, 2, 1, 3)
+                .reshape(W_metric_padded.shape)
+            )
+            W_mask = W_mask_padded[:rows, :cols]
+
+            subset[name].weight.data[W_mask] = 0
+
+        # Update inputs for next layer
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        inps, outs = outs, inps
+
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
-    print("loading calibdation data")
+    print("loading calibration data")
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():

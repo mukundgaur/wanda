@@ -21,6 +21,8 @@ def get_llm(model_name, cache_dir="llm_weights"):
         low_cpu_mem_usage=True, 
         device_map="auto"
     )
+    if not hasattr(model, 'hf_device_map'):
+        model.hf_device_map = {}
 
     model.seqlen = model.config.max_position_embeddings 
     return model
