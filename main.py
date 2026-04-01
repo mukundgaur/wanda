@@ -75,6 +75,8 @@ def main():
             prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif "ablate" in args.prune_method:
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "block":
+            prune_wanda_block(args, model, tokenizer, device, block_size=16)
 
     ################################################################
     print("*"*30)
