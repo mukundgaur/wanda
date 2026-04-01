@@ -1,0 +1,4 @@
+python main.py     --model meta-llama/Llama-2-7b-hf     --prune_method wanda     --sparsity_ratio 0.6     --sparsity_type unstructured --save out/llama2_7b/unstructured/0.6/
+python main.py     --model meta-llama/Llama-2-7b-hf     --prune_method wanda     --sparsity_ratio 0.7     --sparsity_type unstructured  --save out/llama2_7b/unstructured/0.7/
+python main.py     --model meta-llama/Llama-2-7b-hf     --prune_method wanda     --sparsity_ratio 0.4     --sparsity_type unstructured  --save out/llama2_7b/unstructured/0.4/
+python main.py     --model meta-llama/Llama-2-7b-hf     --prune_method wanda     --sparsity_ratio 0.3     --sparsity_type unstructured  --save out/llama2_7b/unstructured/0.3/
