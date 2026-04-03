@@ -191,7 +191,10 @@ def prune_wanda_block(args, model, tokenizer, device=torch.device("cuda:0"), blo
             num_prune = int(num_blocks * args.sparsity_ratio)
             if num_prune > 0:
                 threshold = torch.topk(block_scores.flatten(), num_prune, largest=False)[0][-1]
-                block_mask = block_scores <= threshold
+                _, prune_indices = torch.topk(block_scores.flatten(), num_prune, largest=False)
+                block_mask = torch.zeros(num_blocks, dtype=torch.bool, device=W_metric.device)
+                block_mask.scatter_(0, prune_indices, True)
+                block_mask = block_mask.reshape(br, bc)
             else:
                 block_mask = torch.zeros(br, bc, dtype=torch.bool, device=W_metric.device)
 
