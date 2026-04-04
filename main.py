@@ -51,7 +51,7 @@ def main():
     # Handling n:m sparsity
     prune_n, prune_m = 0, 0
     if args.sparsity_type != "unstructured":
-        assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
+        # assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
 
     model_name = args.model.split("/")[-1]
