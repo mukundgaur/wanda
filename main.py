@@ -5,7 +5,10 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
-from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers, prune_wanda_block
+from lib.prune import (prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate,
+                       check_sparsity, find_layers, prune_wanda_block,
+                       prune_block_magnitude, prune_column_block, prune_batch_aligned,
+                       prune_shared_block_nm, prune_perm_shared_block_nm, prune_batch_row_perm_nm)
 from lib.eval import eval_ppl, eval_zero_shot
 
 print('torch', version('torch'))
@@ -35,7 +38,12 @@ def main():
     parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4", "3:4", "1:4"])
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", "block",
-                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
+                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search",
+                        "block_magnitude", "column_block", "batch_aligned",
+                        "shared_block_nm", "perm_shared_block_nm", "batch_row_perm_nm"])
+    parser.add_argument("--block_size", type=int, default=16, help="Block size for structured pruning strategies.")
+    parser.add_argument("--channels", type=int, default=16, help="CUT-BELL batch size (block-rows per batch) for structured pruning.")
+    parser.add_argument("--m_b", type=int, default=4, help="Window size in block-columns for n:m structured pruning.")
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
@@ -77,6 +85,18 @@ def main():
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "block":
             prune_wanda_block(args, model, tokenizer, device, block_size=16)
+        elif args.prune_method == "block_magnitude":
+            prune_block_magnitude(args, model, tokenizer, device, block_size=args.block_size)
+        elif args.prune_method == "column_block":
+            prune_column_block(args, model, tokenizer, device, block_size=args.block_size)
+        elif args.prune_method == "batch_aligned":
+            prune_batch_aligned(args, model, tokenizer, device, block_size=args.block_size, channels=args.channels)
+        elif args.prune_method == "shared_block_nm":
+            prune_shared_block_nm(args, model, tokenizer, device, block_size=args.block_size, channels=args.channels, m_b=args.m_b)
+        elif args.prune_method == "perm_shared_block_nm":
+            prune_perm_shared_block_nm(args, model, tokenizer, device, block_size=args.block_size, channels=args.channels, m_b=args.m_b)
+        elif args.prune_method == "batch_row_perm_nm":
+            prune_batch_row_perm_nm(args, model, tokenizer, device, block_size=args.block_size, channels=args.channels, m_b=args.m_b)
 
     ################################################################
     print("*"*30)
