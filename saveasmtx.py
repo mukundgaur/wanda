@@ -5,12 +5,12 @@ import scipy.io
 import os
 
 model = AutoModelForCausalLM.from_pretrained(
-    "out/llama2_7b/unstructured/0.3",
+    "out/llama2_7b/shared_block_nm_m4",
     torch_dtype=torch.float16,
     device_map="cpu"
 )
 
-save_dir = "out/llama2_7b/unstructured/0.3/mtx"
+save_dir = "out/llama2_7b/shared_block_nm_m4"
 os.makedirs(save_dir, exist_ok=True)
 
 target_layers = {

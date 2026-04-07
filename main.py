@@ -1,5 +1,5 @@
 import argparse
-import os 
+import os
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -8,7 +8,13 @@ from importlib.metadata import version
 from lib.prune import (prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate,
                        check_sparsity, find_layers, prune_wanda_block,
                        prune_block_magnitude, prune_column_block, prune_batch_aligned,
-                       prune_shared_block_nm, prune_perm_shared_block_nm, prune_batch_row_perm_nm)
+                       prune_shared_block_nm, prune_perm_shared_block_nm, prune_batch_row_perm_nm,
+                       # Scalar / hierarchical strategies
+                       prune_scalar_magnitude, prune_scalar_col_sorted_nm,
+                       prune_scalar_batch_sorted_nm,
+                       prune_hierarchical_block_scalar_nm, prune_hierarchical_sbnm_scalar_nm,
+                       # Activation-aware strategies
+                       prune_wanda_element, prune_block_wanda_nm, prune_scalar_block_wanda)
 from lib.eval import eval_ppl, eval_zero_shot
 
 print('torch', version('torch'))
@@ -18,16 +24,16 @@ print('# of gpus: ', torch.cuda.device_count())
 
 def get_llm(model_name, cache_dir="llm_weights"):
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        torch_dtype=torch.float16, 
-        cache_dir=cache_dir, 
-        low_cpu_mem_usage=True, 
+        model_name,
+        torch_dtype=torch.float16,
+        cache_dir=cache_dir,
+        low_cpu_mem_usage=True,
         device_map="auto"
     )
     if not hasattr(model, 'hf_device_map'):
         model.hf_device_map = {}
 
-    model.seqlen = model.config.max_position_embeddings 
+    model.seqlen = model.config.max_position_embeddings
     return model
 
 def main():
@@ -36,19 +42,53 @@ def main():
     parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
     parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
-    parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4", "3:4", "1:4"])
-    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", "block",
-                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search",
-                        "block_magnitude", "column_block", "batch_aligned",
-                        "shared_block_nm", "perm_shared_block_nm", "batch_row_perm_nm"])
-    parser.add_argument("--block_size", type=int, default=16, help="Block size for structured pruning strategies.")
-    parser.add_argument("--channels", type=int, default=16, help="CUT-BELL batch size (block-rows per batch) for structured pruning.")
-    parser.add_argument("--m_b", type=int, default=4, help="Window size in block-columns for n:m structured pruning.")
-    parser.add_argument("--cache_dir", default="llm_weights", type=str )
-    parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
+    parser.add_argument("--sparsity_type", type=str, default="unstructured",
+                        choices=["unstructured", "4:8", "2:4", "3:4", "1:4"])
+    parser.add_argument("--prune_method", type=str, choices=[
+        # Original methods
+        "magnitude", "wanda", "sparsegpt",
+        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter",
+        "block",
+        # Block-level strategies
+        "block_magnitude", "column_block", "batch_aligned",
+        "shared_block_nm", "perm_shared_block_nm", "batch_row_perm_nm",
+        # Scalar / hierarchical strategies (no calibration data needed)
+        "scalar_magnitude",
+        "scalar_col_sorted_nm",
+        "scalar_batch_sorted_nm",
+        "hier_block_scalar_nm",
+        "hier_sbnm_scalar_nm",
+        # Activation-aware strategies (require calibration data)
+        "wanda_element",
+        "block_wanda_nm",
+        "scalar_block_wanda",
+    ])
+    # Block / CUT-BELL geometry
+    parser.add_argument("--block_size", type=int, default=16,
+                        help="Block size (height and width) for structured pruning strategies.")
+    parser.add_argument("--channels", type=int, default=16,
+                        help="CUT-BELL batch size (block-rows per batch) for structured pruning.")
+    parser.add_argument("--m_b", type=int, default=4,
+                        help="Window size in block-columns for block-level N:M pruning.")
+    parser.add_argument("--n_b", type=int, default=1,
+                        help="Blocks to keep per m_b-window for hier_sbnm_scalar_nm (block-level N:M).")
+    # Element-level N:M parameters (scalar / hierarchical strategies)
+    parser.add_argument("--m_e", type=int, default=32,
+                        help="Window size in elements for per-row element N:M (scalar strategies).")
+    parser.add_argument("--n_e", type=int, default=8,
+                        help="Elements to keep per m_e-window for hierarchical strategies.")
+    # Scalar-block-wanda parameters
+    parser.add_argument("--alpha", type=float, default=0.0,
+                        help="Block density exponent for scalar_block_wanda (0 = pure importance).")
+    parser.add_argument("--scalar_sparsity", type=float, default=None,
+                        help="Fraction of elements to KEEP in the scalar step of scalar_block_wanda; "
+                             "defaults to (1 - sparsity_ratio).")
+    # Misc
+    parser.add_argument("--cache_dir", default="llm_weights", type=str)
+    parser.add_argument('--use_variant', action="store_true",
+                        help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
-
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
 
@@ -56,10 +96,9 @@ def main():
     np.random.seed(args.seed)
     torch.random.manual_seed(args.seed)
 
-    # Handling n:m sparsity
+    # Handling n:m sparsity (only relevant for wanda / magnitude / sparsegpt / ablate)
     prune_n, prune_m = 0, 0
     if args.sparsity_type != "unstructured":
-        # assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
 
     model_name = args.model.split("/")[-1]
@@ -69,7 +108,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
     device = torch.device("cuda:0")
-    if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
+    if "30b" in args.model or "65b" in args.model:
         device = model.hf_device_map["lm_head"]
     print("use device ", device)
 
@@ -85,18 +124,61 @@ def main():
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "block":
             prune_wanda_block(args, model, tokenizer, device, block_size=16)
+        # ── Block-level strategies ──────────────────────────────────────────
         elif args.prune_method == "block_magnitude":
-            prune_block_magnitude(args, model, tokenizer, device, block_size=args.block_size)
+            prune_block_magnitude(args, model, tokenizer, device,
+                                  block_size=args.block_size)
         elif args.prune_method == "column_block":
-            prune_column_block(args, model, tokenizer, device, block_size=args.block_size)
+            prune_column_block(args, model, tokenizer, device,
+                               block_size=args.block_size)
         elif args.prune_method == "batch_aligned":
-            prune_batch_aligned(args, model, tokenizer, device, block_size=args.block_size, channels=args.channels)
+            prune_batch_aligned(args, model, tokenizer, device,
+                                block_size=args.block_size, channels=args.channels)
         elif args.prune_method == "shared_block_nm":
-            prune_shared_block_nm(args, model, tokenizer, device, block_size=args.block_size, channels=args.channels, m_b=args.m_b)
+            prune_shared_block_nm(args, model, tokenizer, device,
+                                  block_size=args.block_size, channels=args.channels,
+                                  m_b=args.m_b)
         elif args.prune_method == "perm_shared_block_nm":
-            prune_perm_shared_block_nm(args, model, tokenizer, device, block_size=args.block_size, channels=args.channels, m_b=args.m_b)
+            prune_perm_shared_block_nm(args, model, tokenizer, device,
+                                       block_size=args.block_size, channels=args.channels,
+                                       m_b=args.m_b)
         elif args.prune_method == "batch_row_perm_nm":
-            prune_batch_row_perm_nm(args, model, tokenizer, device, block_size=args.block_size, channels=args.channels, m_b=args.m_b)
+            prune_batch_row_perm_nm(args, model, tokenizer, device,
+                                    block_size=args.block_size, channels=args.channels,
+                                    m_b=args.m_b)
+        # ── Scalar / hierarchical strategies ───────────────────────────────
+        elif args.prune_method == "scalar_magnitude":
+            prune_scalar_magnitude(args, model, tokenizer, device)
+        elif args.prune_method == "scalar_col_sorted_nm":
+            prune_scalar_col_sorted_nm(args, model, tokenizer, device,
+                                       m_e=args.m_e)
+        elif args.prune_method == "scalar_batch_sorted_nm":
+            prune_scalar_batch_sorted_nm(args, model, tokenizer, device,
+                                         block_size=args.block_size,
+                                         channels=args.channels, m_e=args.m_e)
+        elif args.prune_method == "hier_block_scalar_nm":
+            prune_hierarchical_block_scalar_nm(args, model, tokenizer, device,
+                                               block_size=args.block_size,
+                                               channels=args.channels,
+                                               n_e=args.n_e, m_e=args.m_e)
+        elif args.prune_method == "hier_sbnm_scalar_nm":
+            prune_hierarchical_sbnm_scalar_nm(args, model, tokenizer, device,
+                                              block_size=args.block_size,
+                                              channels=args.channels,
+                                              n_b=args.n_b, m_b=args.m_b,
+                                              n_e=args.n_e, m_e=args.m_e)
+        # ── Activation-aware strategies ─────────────────────────────────────
+        elif args.prune_method == "wanda_element":
+            prune_wanda_element(args, model, tokenizer, device)
+        elif args.prune_method == "block_wanda_nm":
+            prune_block_wanda_nm(args, model, tokenizer, device,
+                                 block_size=args.block_size, channels=args.channels,
+                                 m_b=args.m_b)
+        elif args.prune_method == "scalar_block_wanda":
+            prune_scalar_block_wanda(args, model, tokenizer, device,
+                                     block_size=args.block_size, channels=args.channels,
+                                     m_b=args.m_b, alpha=args.alpha,
+                                     scalar_sparsity=args.scalar_sparsity)
 
     ################################################################
     print("*"*30)
