@@ -1100,6 +1100,8 @@ def prune_hierarchical_sbnm_scalar_nm(args, model, tokenizer,
         layer = layers[i]
         subset = find_layers(layer)
         for name in subset:
+            if i == 0 and "gate_proj" in name:
+                np.save("gate_proj_weights.npy", subset[name].weight.data.float().cpu().numpy())
             print(f"pruning layer {i} name {name}")
             W = subset[name].weight.data.float()
             blocks, orig = _block_view(W, B)
@@ -1128,6 +1130,9 @@ def prune_hierarchical_sbnm_scalar_nm(args, model, tokenizer,
 
             W_pruned = _from_block_view(result, orig, B)
             subset[name].weight.data[:] = W_pruned.to(subset[name].weight.dtype)
+            if i == 0 and "gate_proj" in name:
+                mask_torch = (subset[name].weight.data == 0).cpu().numpy()
+                np.save("mask_torch.npy", mask_torch)
 
 
 # ---------------------------------------------------------------------------
@@ -1417,3 +1422,327 @@ def prune_scalar_block_wanda(args, model, tokenizer, device=torch.device("cuda:0
 
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+
+# ---------------------------------------------------------------------------
+# Shared inner loop for AiM column-greedy strategies
+# ---------------------------------------------------------------------------
+
+def _aim_col_greedy_layer(W: torch.Tensor, imp: torch.Tensor,
+                           density: float, B: int, channels: int) -> torch.Tensor:
+    """Per-batch column-greedy selection for one weight matrix.
+
+    For each CUT-BELL batch of (channels) block-rows:
+      1. Score each block-column by total importance summed over the batch.
+      2. Greedily keep block-columns in descending score order until the
+         proportional element budget is filled.
+      3. The last selected column is partially kept: the top-remaining elements
+         by importance are retained using a threshold mask (ties kept, matching
+         numpy's np.partition behaviour).
+
+    Parameters
+    ----------
+    W        : (M, N) float32 weight tensor
+    imp      : (M, N) float32 importance tensor (|W| or |W|×channel_norms)
+    density  : fraction of elements to keep globally
+    B        : block size (rows and columns)
+    channels : number of block-rows per CUT-BELL batch
+    """
+    M, N = W.shape
+    nb_r = (M + B - 1) // B
+    nb_c = (N + B - 1) // B
+
+    total_budget = max(1, round(density * M * N))
+    result = torch.zeros_like(W)
+    assigned_total = 0
+
+    for batch_start in range(0, nb_r, channels):
+        batch_end  = min(batch_start + channels, nb_r)
+        row_start  = batch_start * B
+        row_end    = min(batch_end * B, M)
+        batch_rows = row_end - row_start
+
+        # Proportional budget (accumulator keeps global nnz exact)
+        batch_budget = round(total_budget * row_end / M) - assigned_total
+
+        W_b   = W[row_start:row_end]    # (batch_rows, N)
+        imp_b = imp[row_start:row_end]  # (batch_rows, N)
+
+        # Score each block-column by summed importance in this batch
+        bc_scores = imp_b.new_zeros(nb_c)
+        for bc in range(nb_c):
+            cs = bc * B; ce = min(cs + B, N)
+            bc_scores[bc] = imp_b[:, cs:ce].sum()
+
+        bc_order = torch.argsort(bc_scores, descending=True)
+
+        batch_result = torch.zeros_like(W_b)
+        filled = 0
+        for bc in bc_order.tolist():
+            cs = bc * B; ce = min(cs + B, N)
+            block_elems = batch_rows * (ce - cs)
+
+            if filled + block_elems <= batch_budget:
+                # Fully keep this block-column
+                batch_result[:, cs:ce] = W_b[:, cs:ce]
+                filled += block_elems
+            else:
+                # Partially keep: top-remaining elements by importance.
+                # kthvalue threshold (ties kept) matches numpy np.partition.
+                remaining = batch_budget - filled
+                if remaining > 0:
+                    col_imp = imp_b[:, cs:ce].flatten()
+                    col_len = len(col_imp)
+                    if remaining < col_len:
+                        thresh = torch.kthvalue(col_imp,
+                                                col_len - remaining + 1).values
+                        col_mask = (col_imp >= thresh).reshape(batch_rows, ce - cs)
+                        batch_result[:, cs:ce] = W_b[:, cs:ce] * col_mask
+                        filled += int(col_mask.sum())
+                    else:
+                        batch_result[:, cs:ce] = W_b[:, cs:ce]
+                        filled += col_len
+                break
+
+            if filled >= batch_budget:
+                break
+
+        result[row_start:row_end] = batch_result
+        assigned_total += filled
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Strategy: AiM column-greedy (magnitude-based, non-n:m, exact density)
+# ---------------------------------------------------------------------------
+
+def prune_aim_col_greedy(args, model, tokenizer, device=torch.device("cuda:0"),
+                          block_size=16, channels=16):
+    """Per-batch column-greedy AiM pruning scored by weight magnitude.
+
+    For each CUT-BELL batch of (channels) block-rows, block-columns are scored
+    by total |W| and selected greedily until the proportional element budget is
+    filled.  The first k-1 columns are kept fully; the k-th is partially kept
+    (top-remaining elements by |W|).  Unlike n:m strategies the number of active
+    columns per batch varies with density and the weight distribution.
+
+    Exact global element density: batch budgets accumulate to
+    round((1 - sparsity_ratio) × M × N).
+    """
+    layers = model.model.layers
+    B = block_size
+    density = 1.0 - args.sparsity_ratio
+
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+        for name in subset:
+            if i == 0 and "gate_proj" in name:
+                np.save("gate_proj_weights.npy", subset[name].weight.data.float().cpu().numpy())
+            print(f"pruning layer {i} name {name}")
+            W = subset[name].weight.data.float()
+            imp = W.abs()
+            W_pruned = _aim_col_greedy_layer(W, imp, density, B, channels)
+            subset[name].weight.data[:] = W_pruned.to(subset[name].weight.dtype)
+            if i == 0 and "gate_proj" in name:
+                mask_torch = (subset[name].weight.data == 0).cpu().numpy()
+                np.save("mask_torch.npy", mask_torch)
+
+
+# ---------------------------------------------------------------------------
+# Strategy: AiM Wanda column-greedy (activation-aware, non-n:m, exact density)
+# ---------------------------------------------------------------------------
+
+def prune_aim_wanda_col_greedy(args, model, tokenizer, device=torch.device("cuda:0"),
+                                block_size=16, channels=16):
+    """Per-batch column-greedy AiM pruning scored by Wanda importance.
+
+    Identical to prune_aim_col_greedy but uses |W[i,j]| x sqrt(scaler_row[j])
+    for both block-column scoring and the within-column partial-keep step.
+    Activation-weighted scoring focuses the greedy selector on input channels
+    that matter for the calibration distribution.
+    """
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    print("loading calibration data")
+    dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed,
+                                seqlen=model.seqlen, tokenizer=tokenizer)
+    print("dataset loading complete")
+
+    with torch.no_grad():
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(
+            model, dataloader, device)
+
+    layers = model.model.layers
+    B = block_size
+    density = 1.0 - args.sparsity_ratio
+
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        if f"model.layers.{i}" in model.hf_device_map:
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            inps, outs, attention_mask, position_ids = (
+                inps.to(dev), outs.to(dev),
+                attention_mask.to(dev), position_ids.to(dev))
+
+        wrapped_layers = {}
+        for name in subset:
+            wrapped_layers[name] = WrappedGPT(subset[name])
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in wrapped_layers:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
+                                position_ids=position_ids)[0]
+        for h in handles:
+            h.remove()
+
+        for name in subset:
+            print(f"pruning layer {i} name {name}")
+            W = subset[name].weight.data.float()
+            channel_norms = torch.sqrt(wrapped_layers[name].scaler_row)  # (in_features,)
+            imp = W.abs() * channel_norms.unsqueeze(0)                   # (out, in)
+            W_pruned = _aim_col_greedy_layer(W, imp, density, B, channels)
+            subset[name].weight.data[:] = W_pruned.to(subset[name].weight.dtype)
+
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
+                                position_ids=position_ids)[0]
+        inps, outs = outs, inps
+
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Strategy: AiM scalar + column-union refinement (non-n:m, density-neutral swap)
+# ---------------------------------------------------------------------------
+
+def prune_aim_scalar_col_refine(args, model, tokenizer, device=torch.device("cuda:0"),
+                                 block_size=16, channels=16):
+    """Scalar magnitude pruning + per-batch column-union refinement.
+
+    Stage 1 - Global scalar magnitude pruning at (1 - sparsity_ratio) density,
+    using a global threshold with ties kept (matching numpy np.partition).
+
+    Stage 2 - Per-batch refinement for each CUT-BELL batch:
+      a. Find the active block-column whose kept elements have the smallest total
+         |W| (the weakest column).
+      b. Collect pruned elements from every other active block-column as
+         restoration candidates.
+      c. If there are at least as many candidates as elements to remove, swap:
+         zero out the weakest column's kept elements and restore the top-n_rm
+         candidates by |W|.  The swap is density-neutral (nnz unchanged).
+
+    AiM effect: reduces column-union per batch when a weak column's non-zeros
+    can be replaced by higher-magnitude elements already in active columns.
+    """
+    layers = model.model.layers
+    B = block_size
+    density = 1.0 - args.sparsity_ratio
+
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+        for name in subset:
+            print(f"pruning layer {i} name {name}")
+            W = subset[name].weight.data.float()
+            M, N = W.shape
+            nb_r = (M + B - 1) // B
+            nb_c = (N + B - 1) // B
+            W_abs = W.abs()
+
+            # Stage 1: global scalar magnitude pruning (ties kept)
+            n_keep = max(1, round(density * M * N))
+            if n_keep < W.numel():
+                thresh = torch.kthvalue(W_abs.flatten(),
+                                        W.numel() - n_keep + 1).values
+                keep_mask = W_abs >= thresh
+            else:
+                keep_mask = torch.ones_like(W, dtype=torch.bool)
+
+            result_mask = keep_mask.clone()
+
+            # Stage 2: per-batch density-neutral swap to shrink column union
+            for batch_start in range(0, nb_r, channels):
+                batch_end = min(batch_start + channels, nb_r)
+                row_start = batch_start * B
+                row_end   = min(batch_end * B, M)
+
+                kept_b  = keep_mask[row_start:row_end]  # (batch_rows, N)
+                W_abs_b = W_abs[row_start:row_end]
+
+                # Which block-columns have at least one kept element?
+                bc_active = torch.zeros(nb_c, dtype=torch.bool, device=W.device)
+                for bc in range(nb_c):
+                    cs = bc * B; ce = min(cs + B, N)
+                    bc_active[bc] = kept_b[:, cs:ce].any()
+
+                if bc_active.sum() < 2:
+                    continue
+
+                active_list = bc_active.nonzero(as_tuple=True)[0].tolist()
+
+                # Score each active block-column: total |W| of kept elements
+                bc_scores = W_abs.new_zeros(len(active_list))
+                for idx, bc in enumerate(active_list):
+                    cs = bc * B; ce = min(cs + B, N)
+                    bc_scores[idx] = (W_abs_b[:, cs:ce] * kept_b[:, cs:ce]).sum()
+
+                weakest_i  = int(bc_scores.argmin())
+                weakest_bc = active_list[weakest_i]
+                w_cs = weakest_bc * B; w_ce = min(w_cs + B, N)
+
+                # Indices of kept elements in the weakest block-column
+                rm_idx = kept_b[:, w_cs:w_ce].nonzero(as_tuple=False)  # (n_rm, 2)
+                n_rm = rm_idx.shape[0]
+                if n_rm == 0:
+                    continue
+
+                # Pruned elements in OTHER active block-columns -> restoration candidates
+                cand_mags, cand_rows, cand_cols = [], [], []
+                for bc in active_list:
+                    if bc == weakest_bc:
+                        continue
+                    cs = bc * B; ce = min(cs + B, N)
+                    pr_idx = (~kept_b[:, cs:ce]).nonzero(as_tuple=False)  # (k, 2)
+                    if pr_idx.shape[0] == 0:
+                        continue
+                    pr_rows       = pr_idx[:, 0]
+                    pr_local_cols = pr_idx[:, 1]
+                    cand_mags.append(W_abs_b[pr_rows, pr_local_cols])
+                    cand_rows.append(pr_rows)
+                    cand_cols.append(pr_local_cols + cs)  # absolute column index
+
+                if not cand_mags:
+                    continue
+
+                all_mags = torch.cat(cand_mags)
+                all_rows = torch.cat(cand_rows)
+                all_cols = torch.cat(cand_cols)
+
+                if all_mags.shape[0] < n_rm:
+                    continue  # not enough candidates to compensate, skip
+
+                # Top n_rm restoration candidates by magnitude
+                _, top_idx = torch.topk(all_mags, n_rm, largest=True)
+                restore_rows = all_rows[top_idx]
+                restore_cols = all_cols[top_idx]
+
+                # Apply density-neutral swap
+                result_mask[row_start + rm_idx[:, 0], w_cs + rm_idx[:, 1]] = False
+                result_mask[row_start + restore_rows, restore_cols] = True
+
+            subset[name].weight.data[:] = (W * result_mask).to(
+                subset[name].weight.dtype)

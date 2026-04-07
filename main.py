@@ -14,7 +14,10 @@ from lib.prune import (prune_wanda, prune_magnitude, prune_sparsegpt, prune_abla
                        prune_scalar_batch_sorted_nm,
                        prune_hierarchical_block_scalar_nm, prune_hierarchical_sbnm_scalar_nm,
                        # Activation-aware strategies
-                       prune_wanda_element, prune_block_wanda_nm, prune_scalar_block_wanda)
+                       prune_wanda_element, prune_block_wanda_nm, prune_scalar_block_wanda,
+                       # AiM column-greedy strategies
+                       prune_aim_col_greedy, prune_aim_wanda_col_greedy,
+                       prune_aim_scalar_col_refine)
 from lib.eval import eval_ppl, eval_zero_shot
 
 print('torch', version('torch'))
@@ -62,6 +65,10 @@ def main():
         "wanda_element",
         "block_wanda_nm",
         "scalar_block_wanda",
+        # AiM column-greedy strategies
+        "aim_col_greedy",
+        "aim_wanda_col_greedy",
+        "aim_scalar_col_refine",
     ])
     # Block / CUT-BELL geometry
     parser.add_argument("--block_size", type=int, default=16,
@@ -174,6 +181,15 @@ def main():
             prune_block_wanda_nm(args, model, tokenizer, device,
                                  block_size=args.block_size, channels=args.channels,
                                  m_b=args.m_b)
+        elif args.prune_method == "aim_col_greedy":
+            prune_aim_col_greedy(args, model, tokenizer, device,
+                                 block_size=args.block_size, channels=args.channels)
+        elif args.prune_method == "aim_wanda_col_greedy":
+            prune_aim_wanda_col_greedy(args, model, tokenizer, device,
+                                       block_size=args.block_size, channels=args.channels)
+        elif args.prune_method == "aim_scalar_col_refine":
+            prune_aim_scalar_col_refine(args, model, tokenizer, device,
+                                        block_size=args.block_size, channels=args.channels)
         elif args.prune_method == "scalar_block_wanda":
             prune_scalar_block_wanda(args, model, tokenizer, device,
                                      block_size=args.block_size, channels=args.channels,
