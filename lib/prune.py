@@ -69,7 +69,8 @@ def prepare_calibration_input(model, dataloader, device):
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
     inps.requires_grad = False
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None,
+             "position_embeddings": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -78,23 +79,25 @@ def prepare_calibration_input(model, dataloader, device):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['attention_mask'] = kwargs.get('attention_mask')
+            cache['position_ids'] = kwargs.get('position_ids')
+            cache['position_embeddings'] = kwargs.get('position_embeddings')
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
             model(batch[0].to(device))
         except ValueError:
-            pass 
+            pass
     layers[0] = layers[0].module
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
     model.config.use_cache = use_cache
 
-    return inps, outs, attention_mask, position_ids 
+    return inps, outs, attention_mask, position_ids, position_embeddings
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     thres_cumsum = sum_before * alpha 
@@ -135,7 +138,7 @@ def prune_wanda_block(args, model, tokenizer, device=torch.device("cuda:0"), blo
     print("dataset loading complete")
 
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+        inps, outs, attention_mask, position_ids, position_embeddings = prepare_calibration_input(model, dataloader, device)
 
     layers = model.model.layers
     for i in range(len(layers)):
@@ -161,7 +164,7 @@ def prune_wanda_block(args, model, tokenizer, device=torch.device("cuda:0"), blo
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
 
         for h in handles:
             h.remove()
@@ -215,7 +218,7 @@ def prune_wanda_block(args, model, tokenizer, device=torch.device("cuda:0"), blo
         # Update inputs for next layer
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
@@ -229,7 +232,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+        inps, outs, attention_mask, position_ids, position_embeddings = prepare_calibration_input(model, dataloader, device)
 
     layers = model.model.layers
     for i in range(len(layers)):
@@ -254,7 +257,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
         for h in handles:
             h.remove()
 
@@ -300,7 +303,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache 
@@ -324,7 +327,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None, "position_embeddings": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -333,8 +336,9 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['attention_mask'] = kwargs.get('attention_mask')
+            cache['position_ids'] = kwargs.get('position_ids')
+            cache['position_embeddings'] = kwargs.get('position_embeddings')
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -348,6 +352,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
 
     print('Ready.')
 
@@ -374,7 +379,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
         for h in handles:
             h.remove()
 
@@ -386,7 +391,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             gpts[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
 
         layers[i] = layer 
         torch.cuda.empty_cache()
@@ -415,7 +420,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None, "position_embeddings": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -424,8 +429,9 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['attention_mask'] = kwargs.get('attention_mask')
+            cache['position_ids'] = kwargs.get('position_ids')
+            cache['position_embeddings'] = kwargs.get('position_embeddings')
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -439,6 +445,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
 
     print('Ready.')
 
@@ -465,7 +472,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
         for h in handles:
             h.remove()
 
@@ -484,7 +491,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             gpts[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
 
         layers[i] = layer
         torch.cuda.empty_cache()
@@ -1159,7 +1166,7 @@ def prune_wanda_element(args, model, tokenizer, device=torch.device("cuda:0")):
     print("dataset loading complete")
 
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(
+        inps, outs, attention_mask, position_ids, position_embeddings = prepare_calibration_input(
             model, dataloader, device)
 
     layers = model.model.layers
@@ -1188,7 +1195,8 @@ def prune_wanda_element(args, model, tokenizer, device=torch.device("cuda:0")):
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings)[0]
         for h in handles:
             h.remove()
 
@@ -1207,7 +1215,8 @@ def prune_wanda_element(args, model, tokenizer, device=torch.device("cuda:0")):
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
@@ -1239,7 +1248,7 @@ def prune_block_wanda_nm(args, model, tokenizer, device=torch.device("cuda:0"),
     print("dataset loading complete")
 
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(
+        inps, outs, attention_mask, position_ids, position_embeddings = prepare_calibration_input(
             model, dataloader, device)
 
     layers = model.model.layers
@@ -1272,7 +1281,8 @@ def prune_block_wanda_nm(args, model, tokenizer, device=torch.device("cuda:0"),
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings)[0]
         for h in handles:
             h.remove()
 
@@ -1305,7 +1315,8 @@ def prune_block_wanda_nm(args, model, tokenizer, device=torch.device("cuda:0"),
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
@@ -1357,7 +1368,7 @@ def prune_scalar_block_wanda(args, model, tokenizer, device=torch.device("cuda:0
     print("dataset loading complete")
 
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(
+        inps, outs, attention_mask, position_ids, position_embeddings = prepare_calibration_input(
             model, dataloader, device)
 
     layers = model.model.layers
@@ -1390,7 +1401,8 @@ def prune_scalar_block_wanda(args, model, tokenizer, device=torch.device("cuda:0
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings)[0]
         for h in handles:
             h.remove()
 
@@ -1417,7 +1429,8 @@ def prune_scalar_block_wanda(args, model, tokenizer, device=torch.device("cuda:0
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
@@ -1571,7 +1584,7 @@ def prune_aim_wanda_col_greedy(args, model, tokenizer, device=torch.device("cuda
     print("dataset loading complete")
 
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(
+        inps, outs, attention_mask, position_ids, position_embeddings = prepare_calibration_input(
             model, dataloader, device)
 
     layers = model.model.layers
@@ -1603,22 +1616,31 @@ def prune_aim_wanda_col_greedy(args, model, tokenizer, device=torch.device("cuda
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings)[0]
         for h in handles:
             h.remove()
 
         for name in subset:
             print(f"pruning layer {i} name {name}")
             W = subset[name].weight.data.float()
+            if i == 0 and "gate_proj" in name:
+                np.save("gate_proj_weights.npy", W.cpu().numpy())
+                np.save("gate_proj_scaler_row.npy",
+                        wrapped_layers[name].scaler_row.cpu().numpy())
             channel_norms = torch.sqrt(wrapped_layers[name].scaler_row)  # (in_features,)
             imp = W.abs() * channel_norms.unsqueeze(0)                   # (out, in)
             W_pruned = _aim_col_greedy_layer(W, imp, density, B, channels)
             subset[name].weight.data[:] = W_pruned.to(subset[name].weight.dtype)
+            if i == 0 and "gate_proj" in name:
+                mask_torch = (subset[name].weight.data == 0).cpu().numpy()
+                np.save("mask_torch.npy", mask_torch)
 
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
@@ -1658,6 +1680,8 @@ def prune_aim_scalar_col_refine(args, model, tokenizer, device=torch.device("cud
         for name in subset:
             print(f"pruning layer {i} name {name}")
             W = subset[name].weight.data.float()
+            if i == 0 and "gate_proj" in name:
+                np.save("gate_proj_weights.npy", W.cpu().numpy())
             M, N = W.shape
             nb_r = (M + B - 1) // B
             nb_c = (N + B - 1) // B
@@ -1695,12 +1719,13 @@ def prune_aim_scalar_col_refine(args, model, tokenizer, device=torch.device("cud
                 active_list = bc_active.nonzero(as_tuple=True)[0].tolist()
 
                 # Score each active block-column: total |W| of kept elements
-                bc_scores = W_abs.new_zeros(len(active_list))
+                bc_scores = np.zeros(len(active_list), dtype=np.float32)
                 for idx, bc in enumerate(active_list):
                     cs = bc * B; ce = min(cs + B, N)
-                    bc_scores[idx] = (W_abs_b[:, cs:ce] * kept_b[:, cs:ce]).sum()
+                    # Pull to CPU and use NumPy sum to guarantee bit-for-bit parity
+                    bc_scores[idx] = (W_abs_b[:, cs:ce] * kept_b[:, cs:ce]).cpu().numpy().sum()
 
-                weakest_i  = int(bc_scores.argmin())
+                weakest_i  = int(np.argmin(bc_scores))
                 weakest_bc = active_list[weakest_i]
                 w_cs = weakest_bc * B; w_ce = min(w_cs + B, N)
 
@@ -1721,7 +1746,7 @@ def prune_aim_scalar_col_refine(args, model, tokenizer, device=torch.device("cud
                         continue
                     pr_rows       = pr_idx[:, 0]
                     pr_local_cols = pr_idx[:, 1]
-                    cand_mags.append(W_abs_b[pr_rows, pr_local_cols])
+                    cand_mags.append(W_abs_b[pr_rows, pr_local_cols + cs])
                     cand_rows.append(pr_rows)
                     cand_cols.append(pr_local_cols + cs)  # absolute column index
 
@@ -1736,7 +1761,8 @@ def prune_aim_scalar_col_refine(args, model, tokenizer, device=torch.device("cud
                     continue  # not enough candidates to compensate, skip
 
                 # Top n_rm restoration candidates by magnitude
-                _, top_idx = torch.topk(all_mags, n_rm, largest=True)
+                _, sorted_idx = torch.sort(all_mags, descending=True, stable=True)
+                top_idx = sorted_idx[:n_rm]
                 restore_rows = all_rows[top_idx]
                 restore_cols = all_cols[top_idx]
 
@@ -1746,3 +1772,6 @@ def prune_aim_scalar_col_refine(args, model, tokenizer, device=torch.device("cud
 
             subset[name].weight.data[:] = (W * result_mask).to(
                 subset[name].weight.dtype)
+            if i == 0 and "gate_proj" in name:
+                mask_torch = (subset[name].weight.data == 0).cpu().numpy()
+                np.save("mask_torch.npy", mask_torch)
