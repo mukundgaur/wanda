@@ -25,7 +25,7 @@ print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
-def get_llm(model_name, cache_dir="llm_weights"):
+def get_llm(model_name, cache_dir="/work/nvme/bfzl/mgaur1/llm_weights"):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
@@ -115,7 +115,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
     device = torch.device("cuda:0")
-    if "30b" in args.model or "65b" in args.model:
+    if ("30b" in args.model or "65b" in args.model) and "opt" not in args.model.lower():
         device = model.hf_device_map["lm_head"]
     print("use device ", device)
 

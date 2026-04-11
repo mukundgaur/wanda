@@ -4,3 +4,4 @@
 *.DS_Store
 llm_weights
 out
+submit.sh
